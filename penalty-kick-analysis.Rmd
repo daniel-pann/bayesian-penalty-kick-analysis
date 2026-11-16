@@ -1,0 +1,567 @@
+---
+title: "Bayesian Analysis of Soccer Penalty Kicks"
+author: "Dailin Pan"
+output:
+  html_document:
+    toc: true
+    df_print: paged
+---
+
+This STATS 551 project estimates player-level penalty conversion probabilities with a hierarchical Beta–Binomial model. Partial pooling accounts for the small, uneven number of kicks taken by each player.
+
+# Data preparation
+
+The raw source is the [Penalty Kick Dataset (2020–2025)](https://www.kaggle.com/datasets/rodrigoarede2003/penalty-kick-dataset-20202025). Each row records a kick, with outcomes coded as 1 for a goal and 0 otherwise.
+
+```{r data-preparation}
+library(tidyverse)
+
+raw_data_path <- "real_data.csv"
+clean_data_path <- "data/pen_clean.csv"
+
+if (file.exists(raw_data_path)) {
+  # The source uses Country for the league and spells goalkeeper as goalkeer.
+  pen_clean <- read_csv(raw_data_path, show_col_types = FALSE) %>%
+    janitor::clean_names() %>%
+    rename(league = country, goalkeeper_name = goalkeer_name) %>%
+    mutate(
+      outcome_num = suppressWarnings(as.numeric(outcome)),
+      y = case_when(
+        outcome_num %in% c(0, 1) ~ as.integer(outcome_num),
+        TRUE ~ NA_integer_
+      )
+    ) %>%
+    filter(!is.na(y)) %>%
+    transmute(
+      y,
+      season = as.character(season),
+      league = str_squish(as.character(league)),
+      player_id = as.integer(player_id),
+      player_name = as.character(player_name),
+      team_type = as.character(team_type),
+      minute = as.integer(minute),
+      home_goals = as.integer(home_goals),
+      away_goals = as.integer(away_goals),
+      kicker_foot = as.character(kicker_foot),
+      kicker_side = as.character(kicker_side),
+      goalie_side = as.character(goalie_side),
+      goalkeeper_id = as.integer(goalkeeper_id),
+      goalkeeper_name = as.character(goalkeeper_name)
+    )
+} else if (file.exists(clean_data_path)) {
+  pen_clean <- read_csv(clean_data_path, show_col_types = FALSE)
+} else {
+  stop("Place real_data.csv next to this notebook or put the cleaned CSV at data/pen_clean.csv.", call. = FALSE)
+}
+```
+
+# Exploratory data analysis
+
+```{r dataset-summary}
+overall_rate <- pen_clean %>%
+  summarise(n = n(), goals = sum(y), rate = mean(y))
+overall_rate
+
+player_df <- pen_clean %>%
+  filter(!is.na(player_name)) %>%
+  group_by(player_name) %>%
+  summarise(
+    N = n(),
+    y = sum(y),
+    raw_rate = y / N,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(N))
+
+player_df %>%
+  transmute(player_name, attempts = N, goals = y, raw_rate) %>%
+  slice_head(n = 15)
+
+player_df %>%
+  summarise(
+    players = n(),
+    percent_one_attempt = 100 * mean(N == 1),
+    percent_three_or_fewer = 100 * mean(N <= 3),
+    median_attempts = median(N)
+  )
+```
+
+```{r exploratory-plots}
+league_summary <- pen_clean %>%
+  group_by(league) %>%
+  summarise(attempts = n(), goals = sum(y), rate = mean(y), .groups = "drop") %>%
+  arrange(desc(attempts))
+league_summary
+
+ggplot(league_summary, aes(x = reorder(league, attempts), y = attempts)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Penalty attempts by league", x = "League", y = "Attempts")
+
+ggplot(player_df, aes(x = N)) +
+  geom_histogram(bins = 25) +
+  labs(
+    title = "Distribution of penalty attempts per player",
+    x = "Attempts",
+    y = "Number of players"
+  )
+
+season_summary <- pen_clean %>%
+  group_by(season) %>%
+  summarise(attempts = n(), goals = sum(y), rate = mean(y), .groups = "drop") %>%
+  arrange(season)
+season_summary
+```
+
+# Prior predictive checks and model fitting
+
+For player $j$, $y_j$ is the number of goals in $N_j$ attempts, with conversion probability $\theta_j$. The model uses a Binomial likelihood and a Beta population distribution parameterized by its mean $\mu$ and concentration $\kappa$. Stan fits the marginal Beta–Binomial model and draws each player's $\theta_j$ in generated quantities.
+
+## Compare the two priors
+
+### Initial concentration prior
+
+\(\kappa \sim Gamma(0.1, 0.1)\)
+```{r}
+prior_mu_draw <- function(n) rbeta(n, 1.5, 1.5)
+prior_kappa_draw <- function(n) rgamma(n, 0.1, 0.1)
+
+prior_predict_one <- function(player_df) {
+  J <- nrow(player_df)
+  N <- player_df$N
+
+  mu    <- prior_mu_draw(1)
+  kappa <- prior_kappa_draw(1)
+
+  alpha <- mu * kappa
+  beta  <- (1 - mu) * kappa
+
+  theta <- rbeta(J, alpha, beta)
+  y_rep <- rbinom(J, size = N, prob = theta)
+
+  tibble(
+    rate_rep = y_rep / pmax(N, 1)
+  )
+}
+```
+
+```{r}
+p_obs <- ggplot(player_df, aes(x = raw_rate)) +
+  geom_histogram(binwidth = 0.05) +
+  labs(title = "Observed data", x = NULL, y = "count") +
+  theme_gray() +
+  theme(
+    plot.title = element_text(color = "red")
+  )
+
+set.seed(321)
+
+sim_plots <- lapply(1:11, function(s) {
+  sim_dat <- prior_predict_one(player_df)
+
+  ggplot(sim_dat, aes(x = rate_rep)) +
+    geom_histogram(binwidth = 0.05) +
+    labs(title = paste0("Simulated data ", s), x = NULL, y = "count") +
+    theme_gray()
+})
+
+gridExtra::grid.arrange(
+  grobs = c(list(p_obs), sim_plots),
+  ncol = 4
+)
+```
+
+### Revised concentration prior
+
+\(\kappa \sim Gamma(4, 0.4)\)
+```{r}
+prior_mu_draw <- function(n) rbeta(n, 1.5, 1.5)
+prior_kappa_draw <- function(n) rgamma(n, 4, 0.4)
+
+prior_predict_one <- function(player_df) {
+  J <- nrow(player_df)
+  N <- player_df$N
+
+  mu    <- prior_mu_draw(1)
+  kappa <- prior_kappa_draw(1)
+
+  alpha <- mu * kappa
+  beta  <- (1 - mu) * kappa
+
+  theta <- rbeta(J, alpha, beta)
+  y_rep <- rbinom(J, size = N, prob = theta)
+
+  tibble(
+    rate_rep = y_rep / pmax(N, 1)
+  )
+}
+```
+
+```{r}
+p_obs <- ggplot(player_df, aes(x = raw_rate)) +
+  geom_histogram(binwidth = 0.05) +
+  labs(title = "Observed data", x = NULL, y = "count") +
+  theme_gray() +
+  theme(
+    plot.title = element_text(color = "red")
+  )
+
+set.seed(321)
+
+sim_plots <- lapply(1:11, function(s) {
+  sim_dat <- prior_predict_one(player_df)
+
+  ggplot(sim_dat, aes(x = rate_rep)) +
+    geom_histogram(binwidth = 0.05) +
+    labs(title = paste0("Simulated data ", s), x = NULL, y = "count") +
+    theme_gray()
+})
+
+gridExtra::grid.arrange(
+  grobs = c(list(p_obs), sim_plots),
+  ncol = 4
+)
+```
+
+## Stan model
+
+```{r}
+library(rstan)
+
+rstan_options(auto_write = TRUE)
+
+stan_code_bb <- "
+data {
+  int<lower=1> J;
+  int<lower=0> y[J];
+  int<lower=0> N[J];
+}
+parameters {
+  real<lower=0, upper=1> mu;
+  real<lower=0> kappa;
+}
+transformed parameters {
+  real<lower=0> alpha;
+  real<lower=0> beta;
+  alpha = mu * kappa;
+  beta  = (1 - mu) * kappa;
+}
+model {
+  // Prior on population mean
+  mu ~ beta(1.5, 1.5);
+  // Prior on concentration parameter:
+  kappa ~ gamma(4, 0.4);
+
+  // Beta-Binomial marginal likelihood
+  for (j in 1:J) {
+    target += lchoose(N[j], y[j])
+              + lbeta(y[j] + alpha, N[j] - y[j] + beta)
+              - lbeta(alpha, beta);
+  }
+}
+generated quantities {
+  vector[J] theta;
+  vector[J] log_lik;
+
+  for (j in 1:J) {
+    // Posterior for player skills given mu,kappa and data
+    theta[j] = beta_rng(alpha + y[j], beta + N[j] - y[j]);
+    // pointwise log-lik for model comparison
+    log_lik[j] = lchoose(N[j], y[j])
+                 + lbeta(y[j] + alpha, N[j] - y[j] + beta)
+                 - lbeta(alpha, beta);
+  }
+}
+"
+```
+
+## Fit and summarize the population parameters
+
+```{r}
+stan_data <- list(
+  J = nrow(player_df),
+  y = player_df$y,
+  N = player_df$N
+)
+
+fit_bb <- stan(
+  model_code = stan_code_bb,
+  data = stan_data,
+  chains = 4,
+  cores = 1,
+  iter = 3000,
+  warmup = 1500,
+  seed = 321,
+  control = list(adapt_delta = 0.99, max_treedepth = 15)
+)
+
+print(fit_bb, pars = c("mu", "kappa"))
+```
+
+# Posterior results and checks
+
+## Player estimates and ranking
+
+```{r}
+library(rstan)
+
+post <- rstan::extract(fit_bb)
+
+theta_mat <- post$theta
+
+stopifnot(!is.null(theta_mat))
+cat("Theta matrix dims:", paste(dim(theta_mat), collapse = " x "), "\n")
+
+# Posterior summaries for players
+player_post <- tibble(
+  player_name = player_df$player_name,
+  attempts    = player_df$N,
+  goals       = player_df$y,
+  raw_rate    = player_df$raw_rate,
+  post_mean   = apply(theta_mat, 2, mean),
+  post_median = apply(theta_mat, 2, median),
+  post_low    = apply(theta_mat, 2, quantile, probs = 0.10),
+  post_high   = apply(theta_mat, 2, quantile, probs = 0.90),
+  post_low95  = apply(theta_mat, 2, quantile, probs = 0.025),
+  post_high95 = apply(theta_mat, 2, quantile, probs = 0.975)
+) %>%
+  arrange(desc(post_mean))
+
+# Top 15 posterior mean
+player_post %>% select(player_name, attempts, raw_rate, post_mean, post_low, post_high) %>% head(15)
+```
+
+### Top 15 by posterior mean
+
+```{r}
+player_post %>%
+  slice_head(n = 15) %>%
+  mutate(player_name = fct_reorder(player_name, post_mean)) %>%
+  ggplot(aes(x = post_mean, y = player_name)) +
+  geom_point() +
+  geom_errorbarh(aes(xmin = post_low, xmax = post_high), height = 0.2) +
+  labs(
+    title = "Top 15 Posterior Mean of Players",
+    x = "Posterior Success Probability (80% interval)",
+    y = ""
+  )
+```
+
+## Posterior predictive checks by player
+
+```{r}
+post_predict_one <- function(player_df, fit_bb) {
+  post <- rstan::extract(fit_bb)
+  mu_all <- post$mu
+  kappa_all <- post$kappa
+
+  s <- sample(seq_along(mu_all), 1)
+
+  mu <- mu_all[s]
+  kappa <- kappa_all[s]
+
+  alpha <- mu * kappa
+  beta  <- (1 - mu) * kappa
+
+  theta_post <- rbeta(
+    n = nrow(player_df),
+    shape1 = alpha + player_df$y,
+    shape2 = beta  + player_df$N - player_df$y
+  )
+
+  y_rep <- rbinom(
+    n = nrow(player_df),
+    size = player_df$N,
+    prob = theta_post
+  )
+
+  tibble(
+    rate_rep = y_rep / pmax(player_df$N, 1)
+  )
+}
+```
+
+```{r}
+p_obs <- ggplot(player_df, aes(x = raw_rate)) +
+  geom_histogram(binwidth = 0.05) +
+  labs(title = "Observed data", x = NULL, y = "count") +
+  theme_gray() +
+  theme(
+    plot.title = element_text(color = "red")
+  )
+
+set.seed(321)
+
+sim_plots <- lapply(1:11, function(s) {
+  sim_dat <- post_predict_one(player_df, fit_bb)
+
+  ggplot(sim_dat, aes(x = rate_rep)) +
+    geom_histogram(binwidth = 0.05) +
+    labs(title = paste0("Simulated data ", s), x = NULL, y = "count") +
+    theme_gray()
+})
+
+gridExtra::grid.arrange(
+  grobs = c(list(p_obs), sim_plots),
+  ncol = 4
+)
+```
+
+## Posterior predictive check for the overall conversion rate
+
+
+```{r}
+set.seed(321)
+post_predict_overall <- function(player_df, fit_bb, S = 1000) {
+  post <- rstan::extract(fit_bb)
+  mu_all <- post$mu
+  kappa_all <- post$kappa
+
+  idx <- sample(seq_along(mu_all), size = min(S, length(mu_all)), replace = FALSE)
+
+  N <- player_df$N
+  y <- player_df$y
+  J <- nrow(player_df)
+
+  overall_rep <- numeric(length(idx))
+
+  for (i in seq_along(idx)) {
+    s <- idx[i]
+
+    mu <- mu_all[s]
+    kappa <- kappa_all[s]
+
+    alpha <- mu * kappa
+    beta  <- (1 - mu) * kappa
+
+    theta_post <- rbeta(
+      n = J,
+      shape1 = alpha + y,
+      shape2 = beta  + N - y
+    )
+
+    y_rep <- rbinom(
+      n = J,
+      size = N,
+      prob = theta_post
+    )
+
+    overall_rep[i] <- sum(y_rep) / sum(N)
+  }
+
+  tibble(overall_rate_rep = overall_rep)
+}
+```
+
+
+```{r}
+set.seed(321)
+obs_overall <- sum(player_df$y) / sum(player_df$N)
+
+overall_sim <- post_predict_overall(player_df, fit_bb, S = 1000)
+
+ggplot(overall_sim, aes(x = overall_rate_rep)) +
+  geom_histogram(bins = 30) +
+  geom_vline(xintercept = obs_overall, linetype = 2) +
+  labs(
+    title = "Posterior Predictive Check: Overall Conversion Rate",
+    subtitle = "Dashed Line = Observed Overall Conversion Rate",
+    x = "Replicated Overall Conversion Rate",
+    y = "Count"
+  )
+```
+
+
+```{r}
+pp_pval <- mean(overall_sim$overall_rate_rep >= obs_overall)
+pp_pval
+```
+
+## Shrinkage
+
+```{r}
+post <- rstan::extract(fit_bb)
+theta_mat <- post$theta
+if (is.null(theta_mat)) {
+  stop("fit_bb does not contain theta in generated quantities.")
+}
+J <- ncol(theta_mat)
+
+plot_df <- tibble(
+  idx = 1:J,
+  label = paste0("theta[", idx, "]"),
+  attempts = player_df$N,
+  goals = player_df$y,
+  raw_rate = player_df$raw_rate,
+  post_mean = apply(theta_mat, 2, mean),
+  lo_95 = apply(theta_mat, 2, quantile, 0.05),
+  hi_95 = apply(theta_mat, 2, quantile, 0.95),
+  lo_50 = apply(theta_mat, 2, quantile, 0.25),
+  hi_50 = apply(theta_mat, 2, quantile, 0.75)
+)
+
+plot_df <- plot_df %>%
+  arrange(post_mean) %>%
+  mutate(label = factor(label, levels = label))
+
+ggplot(plot_df, aes(y = label)) +
+  # wide interval (90%)
+  geom_segment(aes(x = lo_95, xend = hi_95, yend = label),
+               linewidth = 1.0, alpha = 0.35) +
+  # middle interval (50%)
+  geom_segment(aes(x = lo_50, xend = hi_50, yend = label),
+               linewidth = 3.0, alpha = 0.9) +
+  # posterior mean (white dot)
+  geom_point(aes(x = post_mean),
+             shape = 21, fill = "white", size = 3, stroke = 1.0) +
+  # raw rate (red dot)
+  geom_point(aes(x = raw_rate),
+             color = "red", size = 2) +
+  labs(
+    title = "Shrinkage Plot: Raw vs Hierarchical Estimates",
+    x = "Penalty Success Probability",
+    y = NULL
+  ) +
+  xlim(0, 1) +
+  theme_gray()
+```
+
+```{r}
+plot_df <- tibble(
+  idx = 1:J,
+  player_name = player_df$player_name,
+  attempts = player_df$N,
+  goals = player_df$y,
+  raw_rate = player_df$raw_rate,
+  post_mean = apply(theta_mat, 2, mean),
+  lo_95 = apply(theta_mat, 2, quantile, 0.05),
+  hi_95 = apply(theta_mat, 2, quantile, 0.95),
+  lo_50 = apply(theta_mat, 2, quantile, 0.25),
+  hi_50 = apply(theta_mat, 2, quantile, 0.75)
+) %>%
+  arrange(post_mean)
+
+plot_df <- plot_df %>%
+  mutate(label_y = factor(player_name, levels = player_name))
+
+few_threshold <- 2
+
+few_df <- plot_df %>% filter(attempts <= few_threshold)
+
+ggplot(few_df, aes(y = label_y)) +
+  geom_segment(aes(x = lo_95, xend = hi_95, yend = label_y),
+               linewidth = 1.0, alpha = 0.35) +
+  geom_segment(aes(x = lo_50, xend = hi_50, yend = label_y),
+               linewidth = 3.0, alpha = 0.9) +
+  geom_point(aes(x = post_mean),
+             shape = 21, fill = "white", size = 3, stroke = 1.0) +
+  geom_point(aes(x = raw_rate),
+             color = "red", size = 2) +
+  labs(
+    title = "Shrinkage Plot: Raw vs Hierarchical Estimates (N=1,2)",
+    x = "Penalty Success Probability",
+    y = NULL
+  ) +
+  xlim(0, 1) +
+  theme_gray()
+```
